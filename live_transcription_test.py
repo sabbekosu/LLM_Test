@@ -1,101 +1,139 @@
-from __future__ import annotations
-
-import array
 import queue
+import re
 import threading
 import time
-from typing import Final
+from typing import Dict, List
 
 import numpy as np
-import sounddevice as sd
+import pyaudio
 from faster_whisper import WhisperModel
 
-# ────────────────────────────────── CONFIG ───────────────────────────────────
-MODEL_SIZE: Final[str] = "tiny.en"    # fastest English‑only model (<40 MB int8)
-DEVICE: Final[str] = "cpu"            # Pi 5 has no CUDA, Metal, etc.
-COMPUTE_TYPE: Final[str] = "int8"     # int8 quantization: fastest & smallest
-SAMPLE_RATE: Final[int] = 16_000      # Whisper expects 16 kHz mono
-CHUNK_SECONDS: Final[float] = 1.0     # lower = snappier; higher = fewer calls
-RING_SECONDS: Final[int] = 4          # keep last N seconds in RAM
+# Yeah I could do this config with argparse, but I won't...
 
-VAD_PADDING_MS: Final[int] = 150      # speech padding for VAD filter
-BEAM_SIZE: Final[int] = 1             # greedy decoding – speed > accuracy
+# Audio settings
+STEP_IN_SEC: int = 1    # We'll increase the processable audio data by this
+LENGHT_IN_SEC: int = 6    # We'll process this amount of audio data together maximum
+NB_CHANNELS = 1
+RATE = 16000
+CHUNK = RATE
 
-# ─────────────────────────────── GLOBALS ────────────────────────────────────
-audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=RING_SECONDS * 2)
-stop_event = threading.Event()
+# Whisper settings
+WHISPER_LANGUAGE = "en"
+WHISPER_THREADS = 4
 
-CHUNK_SAMPLES: Final[int] = int(SAMPLE_RATE * CHUNK_SECONDS)
-MAX_SAMPLES: Final[int] = int(SAMPLE_RATE * RING_SECONDS)
+# Visualization (expected max number of characters for LENGHT_IN_SEC audio)
+MAX_SENTENCE_CHARACTERS = 80
 
-# ─────────────────────────── AUDIO CAPTURE ──────────────────────────────────
+# This queue holds all the 1-second audio chunks
+audio_queue = queue.Queue()
 
-def _audio_callback(indata, frames, _time, status):
-    """Convert float32 −1…1 mic audio to int16 PCM and push to queue."""
-    if status:
-        print(status, flush=True)
-    pcm16 = (indata[:, 0] * 32768).astype(np.int16)
-    try:
-        audio_q.put_nowait(pcm16)
-    except queue.Full:
-        pass  # drop chunk if the CPU is too busy
+# This queue holds all the chunks that will be processed together
+# If the chunk is filled to the max, it will be emptied
+length_queue = queue.Queue(maxsize=LENGHT_IN_SEC)
 
-# ──────────────────────────── TRANSCRIPTION ─────────────────────────────────
+# Whisper model
+whisper = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=WHISPER_THREADS, download_root="./models")
 
-def _transcriber(model: WhisperModel):
-    ring = array.array("h")  # 16‑bit mono rolling buffer
 
-    while not stop_event.is_set():
-        try:
-            chunk = audio_q.get(timeout=0.2)
-        except queue.Empty:
-            continue
+def producer_thread():
+    audio = pyaudio.PyAudio()
+    stream = audio.open(
+        format=pyaudio.paInt16,
+        channels=NB_CHANNELS,
+        rate=RATE,
+        input=True,
+        frames_per_buffer=CHUNK,    # 1 second of audio
+    )
 
-        ring.extend(chunk)
-        # Trim to last MAX_SAMPLES samples
-        if len(ring) > MAX_SAMPLES:
-            del ring[:-MAX_SAMPLES]
+    print("-" * 80)
+    print("Microphone initialized, recording started...")
+    print("-" * 80)
+    print("TRANSCRIPTION")
+    print("-" * 80)
 
-        if len(ring) >= CHUNK_SAMPLES:
-            pcm = np.frombuffer(ring, dtype=np.int16)[-CHUNK_SAMPLES:]
-            audio_f32 = pcm.astype(np.float32) / 32768.0
-            segments, _ = model.transcribe(
-                audio_f32,
-                language="en",
-                beam_size=BEAM_SIZE,
-                vad_filter=True,
-                vad_parameters=dict(speech_pad_ms=VAD_PADDING_MS),
-                word_timestamps=False,
-            )
-            for s in segments:
-                print(s.text.strip(), flush=True)
+    while True:
+        audio_data = b""
+        for _ in range(STEP_IN_SEC):
+            chunk = stream.read(RATE)    # Read 1 second of audio data
+            audio_data += chunk
 
-# ──────────────────────────────── MAIN ─────────────────────────────────────
+        audio_queue.put(audio_data)    # Put the 5-second audio data into the queue
 
-def main() -> None:
-    print("Loading faster‑whisper…", flush=True)
-    model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-    print("Listening…  (Ctrl‑C to quit)", flush=True)
 
-    trans_thread = threading.Thread(target=_transcriber, args=(model,), daemon=True)
-    trans_thread.start()
+# Thread which gets items from the queue and prints its length
+def consumer_thread(stats):
+    while True:
+        if length_queue.qsize() >= LENGHT_IN_SEC:
+            with length_queue.mutex:
+                length_queue.queue.clear()
+                print()
 
-    try:
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=0,  # let PortAudio pick low‑latency size
-            callback=_audio_callback,
-        ):
-            while True:
-                time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("Stopping…", flush=True)
-    finally:
-        stop_event.set()
-        trans_thread.join()
+        audio_data = audio_queue.get()
+        transcription_start_time = time.time()
+        length_queue.put(audio_data)
+
+        # Concatenate audio data in the lenght_queue
+        audio_data_to_process = b""
+        for i in range(length_queue.qsize()):
+            # We index it so it won't get removed
+            audio_data_to_process += length_queue.queue[i]
+
+        # convert the bytes data toa  numpy array
+        audio_data_array: np.ndarray = np.frombuffer(audio_data_to_process, np.int16).astype(np.float32) / 255.0
+        # audio_data_array = np.expand_dims(audio_data_array, axis=0)
+
+        segments, _ = whisper.transcribe(audio_data_array,
+                                         language=WHISPER_LANGUAGE,
+                                         beam_size=5,
+                                         vad_filter=True,
+                                         vad_parameters=dict(min_silence_duration_ms=1000))
+        segments = [s.text for s in segments]
+
+        transcription_end_time = time.time()
+
+        transcription = " ".join(segments)
+        # remove anything from the text which is between () or [] --> these are non-verbal background noises/music/etc.
+        transcription = re.sub(r"\[.*\]", "", transcription)
+        transcription = re.sub(r"\(.*\)", "", transcription)
+        # We do this for the more clean visualization (when the next transcription we print would be shorter then the one we printed)
+        transcription = transcription.ljust(MAX_SENTENCE_CHARACTERS, " ")
+
+        transcription_postprocessing_end_time = time.time()
+
+        print(transcription, end='\r', flush=True)
+
+        audio_queue.task_done()
+
+        overall_elapsed_time = transcription_postprocessing_end_time - transcription_start_time
+        transcription_elapsed_time = transcription_end_time - transcription_start_time
+        postprocessing_elapsed_time = transcription_postprocessing_end_time - transcription_end_time
+        stats["overall"].append(overall_elapsed_time)
+        stats["transcription"].append(transcription_elapsed_time)
+        stats["postprocessing"].append(postprocessing_elapsed_time)
 
 
 if __name__ == "__main__":
-    main()
+    stats: Dict[str, List[float]] = {"overall": [], "transcription": [], "postprocessing": []}
+
+    producer = threading.Thread(target=producer_thread)
+    producer.start()
+
+    consumer = threading.Thread(target=consumer_thread, args=(stats,))
+    consumer.start()
+
+    try:
+        producer.join()
+        consumer.join()
+    except KeyboardInterrupt:
+        print("Exiting...")
+        # print out the statistics
+        print("Number of processed chunks: ", len(stats["overall"]))
+        print(f"Overall time: avg: {np.mean(stats['overall']):.4f}s, std: {np.std(stats['overall']):.4f}s")
+        print(
+            f"Transcription time: avg: {np.mean(stats['transcription']):.4f}s, std: {np.std(stats['transcription']):.4f}s"
+        )
+        print(
+            f"Postprocessing time: avg: {np.mean(stats['postprocessing']):.4f}s, std: {np.std(stats['postprocessing']):.4f}s"
+        )
+        # We need to add the step_in_sec to the latency as we need to wait for that chunk of audio
+        print(f"The average latency is {np.mean(stats['overall'])+STEP_IN_SEC:.4f}s")

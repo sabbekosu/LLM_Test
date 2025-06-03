@@ -45,11 +45,11 @@ class LLM_Joke(object):
         response = requests.post(url, headers=headers, json=data)
         return response.json()['message']['content']
 
-    def whisper_stt(self):
-        model = whisper.load_model("tiny.en")
-        result = model.transcribe("location.wav")
-        print(result["text"])
-        return result["text"]
+    def faster_whisper_stt(self):
+        model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe("location.wav", beam_size=1)
+        text = " ".join(seg.text.strip() for seg in segments)
+        return text
 
     def vosk_stt(self, audio_path="location.wav", model_path="vosk-model"):
         # Load Vosk model
@@ -88,13 +88,12 @@ class LLM_Joke(object):
     def main(self):
         self.record_audio()
         start = time.time()
-        location = self.vosk_stt()
-        self.stt_result = location
+        self.stt_result = self.faster_whisper_stt()
         print(f"Whisper Time: {time.time() - start}")
         #os.remove("location.wav")
         
         start_llm = time.time()
-        request = self.joke_script.format(location=location)
+        request = self.joke_script.format(location=self.stt_result)
         response = self.llama3(self.url, request)
         print(f"LLM Time: {time.time() - start_llm}")
 
