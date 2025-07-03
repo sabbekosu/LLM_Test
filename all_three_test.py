@@ -4,9 +4,10 @@ import time
 import os
 import re
 import subprocess
-import whisper
+
 import sounddevice as sd
 from scipy.io.wavfile import write
+
 #Vosk
 import wave
 import json
